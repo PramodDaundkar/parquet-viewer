@@ -634,7 +634,7 @@
 </div>
 
 <script type="module">
-import { parquetRead, parquetMetadata } from 'https://esm.sh/hyparquet@1';
+import { parquetRead, parquetMetadata, parquetMetadataAsync } from 'https://esm.sh/hyparquet@1';
 
 /* ─── state ─────────────────────────────────────────────── */
 let allRows        = [];   // raw rows (array-of-arrays)
@@ -660,6 +660,7 @@ let duckCache    = new Map();   // pageIdx → rows[]
 let duckFetching = new Set();   // pages currently being fetched
 let duckDB       = null;        // AsyncDuckDB instance (lazy)
 let duckConn     = null;        // open connection
+let duckMod      = null;        // DuckDB WASM module (for DuckDBDataProtocol enum)
 const DUCK_THRESHOLD = 100_000; // auto-switch threshold
 const DUCK_PAGE      = 2_000;   // rows per page fetch
 const COL_W        = 160;
@@ -759,11 +760,15 @@ async function loadFile(file) {
   showLoading();
   setProgress(0, `Reading ${file.name}…`);
   try {
-    const buf      = await file.arrayBuffer();
-    const asyncBuf = { byteLength: buf.byteLength, slice: async (s, e) => buf.slice(s, e) };
-    const meta     = parquetMetadata(buf);
-    const numRows  = Number(meta.num_rows);
-    const schema   = meta.schema || [];
+    // Lazy file slice — reads only the parquet footer (a few KB) for metadata.
+    // For large files this avoids loading the full file into memory just to get the row count.
+    const lazyBuf = {
+      byteLength: file.size,
+      slice: async (start, end) => file.slice(start, end).arrayBuffer(),
+    };
+    const meta    = await parquetMetadataAsync(lazyBuf);
+    const numRows = Number(meta.num_rows);
+    const schema  = meta.schema || [];
 
     columns = schema.slice(1).filter(s => s.name !== undefined).map(s => s.name);
     colVisible = {}; colWidths = {}; colFilters = {};
@@ -776,10 +781,10 @@ async function loadFile(file) {
     document.getElementById('s-size').textContent = fmtBytes(file.size);
 
     if (numRows > DUCK_THRESHOLD) {
-      // ── DuckDB path ──────────────────────────────────────────
+      // ── DuckDB path — no full file read, File handle passed directly ─
       duckMode = true; duckFilter = ''; duckOrderBy = '';
       duckCache.clear(); duckFetching.clear();
-      const { columns: dkCols, rowCount } = await loadWithDuckDB(file, buf);
+      const { columns: dkCols, rowCount } = await loadWithDuckDB(file);
       if (dkCols.length) {
         columns = dkCols;
         colVisible = {}; colWidths = {}; colFilters = {};
@@ -789,9 +794,11 @@ async function loadFile(file) {
       document.getElementById('s-rows').textContent = rowCount.toLocaleString();
       document.getElementById('duck-mode-badge').style.display = 'inline-flex';
     } else {
-      // ── hyparquet path ───────────────────────────────────────
+      // ── hyparquet path — read full file only for small files ─
       duckMode = false;
       document.getElementById('duck-mode-badge').style.display = 'none';
+      const buf      = await file.arrayBuffer();
+      const asyncBuf = { byteLength: buf.byteLength, slice: async (s, e) => buf.slice(s, e) };
       allRows = [];
       await parquetRead({
         file: asyncBuf,
@@ -841,6 +848,7 @@ async function ensureDuckDB() {
   setProgress(15, 'Loading DuckDB engine (~6 MB)…');
   // JS via esm.sh (works from file:// — same CDN used for hyparquet)
   const mod = await import('https://esm.sh/@duckdb/duckdb-wasm');
+  duckMod = mod;   // store for DuckDBDataProtocol access
   // WASM binary + worker from jsDelivr (binary fetch is fine cross-origin)
   const WASM = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm/dist/';
   const bundles = {
@@ -862,14 +870,20 @@ async function ensureDuckDB() {
   duckConn = await duckDB.connect();
 }
 
-async function loadWithDuckDB(file, buf) {
+async function loadWithDuckDB(file) {
   await ensureDuckDB();
-  setProgress(50, 'Registering file with DuckDB…');
-  await duckDB.registerFileBuffer('upload.parquet', new Uint8Array(buf));
+  setProgress(50, 'Registering file handle with DuckDB…');
+
+  // Strategy B: pass File object directly — DuckDB reads byte ranges on demand
+  // BROWSER_FILEREADER = 2 in the DuckDBDataProtocol enum
+  const protocol = duckMod?.DuckDBDataProtocol?.BROWSER_FILEREADER ?? 2;
+  await duckDB.registerFileHandle('upload.parquet', file, protocol, true);
+
   setProgress(65, 'Scanning schema…');
   await duckConn.query("CREATE OR REPLACE VIEW data AS SELECT * FROM read_parquet('upload.parquet')");
   const schemaRes = await duckConn.query('DESCRIBE data');
   const dkCols    = schemaRes.toArray().map(r => r.column_name);
+
   setProgress(80, 'Counting rows…');
   const countRes = await duckConn.query('SELECT COUNT(*)::BIGINT AS n FROM data');
   const total    = Number(countRes.toArray()[0].n);
