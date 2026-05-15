@@ -1,20 +1,9 @@
-# Parquet Viewer
+# ⚠️ This repo has moved
 
-A lightweight, browser-based Parquet file viewer. No installation required — open `index.html` in any modern browser.
+**[Data Viewer](https://github.com/PramodDaundkar/data-viewer)** is the new unified viewer that supports both Parquet and CSV files.
 
-## Features
-- Drag & drop `.parquet` / `.parq` files
-- Virtual scrolling (handles millions of rows)
-- Per-column filtering with AND logic
-- Global search with match highlighting
-- Sort by any column
-- Drag-to-resize columns
-- Toggle column visibility
-- SQL query editor (powered by AlaSQL) with autocomplete
+👉 **New URL:** https://pramoddaundkar.github.io/data-viewer/
 
-## Usage
-1. Open `index.html` in your browser
-2. Drop a parquet file onto the upload zone
-3. Explore your data
+---
 
-All processing happens locally in your browser — no data is ever uploaded.
+This repo (`parquet-viewer`) is no longer actively maintained. The code remains here and the GitHub Pages URL continues to work, but all future development happens in [data-viewer](https://github.com/PramodDaundkar/data-viewer).
