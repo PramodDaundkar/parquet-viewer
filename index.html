@@ -839,14 +839,16 @@ function setProgress(pct, msg, detail) {
 async function ensureDuckDB() {
   if (duckDB) return;
   setProgress(15, 'Loading DuckDB engine (~6 MB)…');
-  const CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm/dist/';
-  const mod = await import(CDN + 'duckdb-esm.js');
+  // JS via esm.sh (works from file:// — same CDN used for hyparquet)
+  const mod = await import('https://esm.sh/@duckdb/duckdb-wasm');
+  // WASM binary + worker from jsDelivr (binary fetch is fine cross-origin)
+  const WASM = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm/dist/';
   const bundles = {
-    mvp: { mainModule: CDN + 'duckdb-mvp.wasm',
-           mainWorker: CDN + 'duckdb-browser-mvp.worker.js' },
-    eh:  { mainModule: CDN + 'duckdb-eh.wasm',
-           mainWorker: CDN + 'duckdb-browser-eh.worker.js',
-           pthreadWorker: CDN + 'duckdb-browser-eh.pthread.worker.js' },
+    mvp: { mainModule: WASM + 'duckdb-mvp.wasm',
+           mainWorker: WASM + 'duckdb-browser-mvp.worker.js' },
+    eh:  { mainModule: WASM + 'duckdb-eh.wasm',
+           mainWorker: WASM + 'duckdb-browser-eh.worker.js',
+           pthreadWorker: WASM + 'duckdb-browser-eh.pthread.worker.js' },
   };
   const bundle    = await mod.selectBundle(bundles);
   const workerUrl = URL.createObjectURL(
