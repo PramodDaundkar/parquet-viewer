@@ -95,7 +95,15 @@
       border-radius: 50%;
       animation: spin 0.75s linear infinite;
     }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes spin  { to { transform: rotate(360deg); } }
+    @keyframes pulse { 0%,100% { opacity:.35; } 50% { opacity:.9; } }
+    /* DuckDB engine badge */
+    #duck-mode-badge {
+      display: none; align-items: center; gap: 5px;
+      padding: 2px 10px; background: rgba(63,185,80,0.1);
+      border: 1px solid #3fb950; border-radius: 10px;
+      font-size: 11px; color: #3fb950; font-weight: 600;
+    }
     #loading-msg { font-size: 14px; color: #8b949e; }
     #progress-wrap { width: 280px; height: 5px; background: #21262d; border-radius: 3px; overflow: hidden; }
     #progress-bar  { height: 100%; width: 0%; background: #58a6ff; border-radius: 3px; transition: width 0.25s; }
@@ -540,6 +548,7 @@
     <div class="divider"></div>
     <span class="stat">Showing: <strong id="s-showing">—</strong></span>
     <div class="divider"></div>
+    <span id="duck-mode-badge">🦆 DuckDB Engine</span>
     <span id="query-mode-badge" title="Click to exit query mode">
       <svg width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
         <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
@@ -638,10 +647,21 @@ let sortCol        = null;
 let sortDir        = 'asc';
 let searchQuery    = '';
 // SQL query state
-let queryMode      = false;
-let queryResultCols = null;  // column names from last SQL result
-let queryResultRows = null;  // array-of-arrays from last SQL result
-let rowObjects      = [];    // allRows as objects — fed to AlaSQL
+let queryMode       = false;
+let queryResultCols = null;
+let queryResultRows = null;
+let rowObjects      = [];       // for AlaSQL (small-file mode)
+// DuckDB state
+let duckMode     = false;       // true → DuckDB is the active engine
+let duckTotal    = 0;           // total rows (current filter)
+let duckFilter   = '';          // current WHERE clause
+let duckOrderBy  = '';          // current ORDER BY clause
+let duckCache    = new Map();   // pageIdx → rows[]
+let duckFetching = new Set();   // pages currently being fetched
+let duckDB       = null;        // AsyncDuckDB instance (lazy)
+let duckConn     = null;        // open connection
+const DUCK_THRESHOLD = 100_000; // auto-switch threshold
+const DUCK_PAGE      = 2_000;   // rows per page fetch
 const COL_W        = 160;
 const COL_MIN      = 40;
 const ROW_H        = 32;
@@ -721,6 +741,9 @@ document.getElementById('load-new-btn').addEventListener('click', () => {
   colVisible = {}; colWidths = {}; colFilters = {};
   sortCol = null; searchQuery = '';
   queryMode = false; queryResultCols = null; queryResultRows = null;
+  duckMode = false; duckTotal = 0; duckFilter = ''; duckOrderBy = '';
+  duckCache.clear(); duckFetching.clear();
+  document.getElementById('duck-mode-badge').style.display = 'none';
   searchBox.value = ''; searchInfo.textContent = '';
   clearFiltersBtn.style.display = 'none';
   queryPanel.classList.remove('open');
@@ -735,86 +758,71 @@ document.getElementById('load-new-btn').addEventListener('click', () => {
 async function loadFile(file) {
   showLoading();
   setProgress(0, `Reading ${file.name}…`);
-
   try {
-    const buf = await file.arrayBuffer();
+    const buf      = await file.arrayBuffer();
+    const asyncBuf = { byteLength: buf.byteLength, slice: async (s, e) => buf.slice(s, e) };
+    const meta     = parquetMetadata(buf);
+    const numRows  = Number(meta.num_rows);
+    const schema   = meta.schema || [];
 
-    // Wrap ArrayBuffer as AsyncBuffer for hyparquet
-    const asyncBuf = {
-      byteLength: buf.byteLength,
-      slice: async (start, end) => buf.slice(start, end),
-    };
-
-    // Metadata
-    const meta = parquetMetadata(buf);
-    const numRows = Number(meta.num_rows);
-    const schema  = meta.schema || [];
-
-    // Column names: skip root schema element (index 0)
-    columns = schema
-      .slice(1)
-      .filter(s => s.name !== undefined)
-      .map(s => s.name);
-
-    // Initialise visibility, widths & filters
+    columns = schema.slice(1).filter(s => s.name !== undefined).map(s => s.name);
     colVisible = {}; colWidths = {}; colFilters = {};
     columns.forEach(c => { colVisible[c] = true; colWidths[c] = COL_W; colFilters[c] = ''; });
     clearFiltersBtn.style.display = 'none';
-
-    // Read rows via streaming chunks
-    allRows = [];
-    await parquetRead({
-      file: asyncBuf,
-      onComplete: (rows) => {
-        if (rows && rows.length) allRows.push(...rows);
-        setProgress(
-          numRows > 0 ? Math.round((allRows.length / numRows) * 100) : 50,
-          `Loading rows… ${allRows.length.toLocaleString()} / ${numRows.toLocaleString()}`
-        );
-      },
-    });
-
-    // If onComplete gave us row-objects instead of arrays, normalise
-    if (allRows.length && !Array.isArray(allRows[0])) {
-      allRows = allRows.map(r => columns.map(c => r[c]));
-    }
-
-    // Stats
-    document.getElementById('s-rows').textContent = allRows.length.toLocaleString();
+    sortCol = null;
+    queryMode = false; queryResultCols = null; queryResultRows = null;
     document.getElementById('s-cols').textContent = columns.length;
     document.getElementById('s-file').textContent = file.name;
     document.getElementById('s-size').textContent = fmtBytes(file.size);
 
-    filteredRows = allRows;
-
-    // Build row-objects for AlaSQL (keyed by column name)
-    rowObjects = allRows.map(row => {
-      const obj = {};
-      columns.forEach((col, ci) => { obj[col] = row[ci]; });
-      return obj;
-    });
-    // Register as the 'data' table in AlaSQL
-    if (window.alasql) {
-      alasql('DROP TABLE IF EXISTS `data`');
-      alasql('CREATE TABLE `data`');
-      alasql.tables['data'].data = rowObjects;
+    if (numRows > DUCK_THRESHOLD) {
+      // ── DuckDB path ──────────────────────────────────────────
+      duckMode = true; duckFilter = ''; duckOrderBy = '';
+      duckCache.clear(); duckFetching.clear();
+      const { columns: dkCols, rowCount } = await loadWithDuckDB(file, buf);
+      if (dkCols.length) {
+        columns = dkCols;
+        colVisible = {}; colWidths = {}; colFilters = {};
+        columns.forEach(c => { colVisible[c] = true; colWidths[c] = COL_W; colFilters[c] = ''; });
+      }
+      duckTotal = rowCount;
+      document.getElementById('s-rows').textContent = rowCount.toLocaleString();
+      document.getElementById('duck-mode-badge').style.display = 'inline-flex';
+    } else {
+      // ── hyparquet path ───────────────────────────────────────
+      duckMode = false;
+      document.getElementById('duck-mode-badge').style.display = 'none';
+      allRows = [];
+      await parquetRead({
+        file: asyncBuf,
+        onComplete: rows => {
+          if (rows && rows.length) allRows.push(...rows);
+          setProgress(
+            numRows > 0 ? Math.round((allRows.length / numRows) * 100) : 50,
+            `Loading rows… ${allRows.length.toLocaleString()} / ${numRows.toLocaleString()}`
+          );
+        },
+      });
+      if (allRows.length && !Array.isArray(allRows[0])) {
+        allRows = allRows.map(r => columns.map(c => r[c]));
+      }
+      filteredRows = allRows;
+      document.getElementById('s-rows').textContent = allRows.length.toLocaleString();
+      rowObjects = allRows.map(row => {
+        const obj = {}; columns.forEach((c, i) => { obj[c] = row[i]; }); return obj;
+      });
+      if (window.alasql) {
+        alasql('DROP TABLE IF EXISTS `data`');
+        alasql('CREATE TABLE `data`');
+        alasql.tables['data'].data = rowObjects;
+      }
     }
 
-    // Reset query mode
-    queryMode = false; queryResultCols = null; queryResultRows = null;
-    queryPanel.classList.remove('open');
-    querySql.value = '';
-    queryError.classList.remove('visible');
-    queryStatus.classList.remove('visible');
-    queryModeBadge.classList.remove('visible');
-    document.body.classList.remove('query-mode');
-
-    updateShowing();
-    buildColPanel();
-    buildColChips();
-    buildHeader();
-    setupVirtualScroll();
-    showViewer();
+    queryPanel.classList.remove('open'); querySql.value = '';
+    queryError.classList.remove('visible'); queryStatus.classList.remove('visible');
+    queryModeBadge.classList.remove('visible'); document.body.classList.remove('query-mode');
+    updateShowing(); buildColPanel(); buildColChips(); buildHeader();
+    setupVirtualScroll(); showViewer();
   } catch (err) {
     console.error(err);
     showError(`Could not read the parquet file.\n\n${err.message}`);
@@ -827,10 +835,118 @@ function setProgress(pct, msg, detail) {
   if (detail) document.getElementById('loading-detail').textContent = detail;
 }
 
+/* ─── DuckDB WASM engine ─────────────────────────────────── */
+async function ensureDuckDB() {
+  if (duckDB) return;
+  setProgress(15, 'Loading DuckDB engine (~6 MB)…');
+  const CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/';
+  const mod = await import(CDN + 'duckdb-esm.js');
+  const bundles = {
+    mvp: { mainModule: CDN + 'duckdb-mvp.wasm',
+           mainWorker: CDN + 'duckdb-browser-mvp.worker.js' },
+    eh:  { mainModule: CDN + 'duckdb-eh.wasm',
+           mainWorker: CDN + 'duckdb-browser-eh.worker.js',
+           pthreadWorker: CDN + 'duckdb-browser-eh.pthread.worker.js' },
+  };
+  const bundle    = await mod.selectBundle(bundles);
+  const workerUrl = URL.createObjectURL(
+    new Blob([`importScripts("${bundle.mainWorker}");`], { type: 'application/javascript' })
+  );
+  const worker = new Worker(workerUrl);
+  const logger = new mod.ConsoleLogger(mod.LogLevel.WARNING);
+  duckDB = new mod.AsyncDuckDB(logger, worker);
+  await duckDB.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(workerUrl);
+  duckConn = await duckDB.connect();
+}
+
+async function loadWithDuckDB(file, buf) {
+  await ensureDuckDB();
+  setProgress(50, 'Registering file with DuckDB…');
+  await duckDB.registerFileBuffer('upload.parquet', new Uint8Array(buf));
+  setProgress(65, 'Scanning schema…');
+  await duckConn.query("CREATE OR REPLACE VIEW data AS SELECT * FROM read_parquet('upload.parquet')");
+  const schemaRes = await duckConn.query('DESCRIBE data');
+  const dkCols    = schemaRes.toArray().map(r => r.column_name);
+  setProgress(80, 'Counting rows…');
+  const countRes = await duckConn.query('SELECT COUNT(*)::BIGINT AS n FROM data');
+  const total    = Number(countRes.toArray()[0].n);
+  return { columns: dkCols, rowCount: total };
+}
+
+function arrowToRows(result, cols) {
+  return result.toArray().map(row =>
+    cols.map(col => {
+      const v = row[col];
+      if (v === null || v === undefined) return null;
+      if (typeof v === 'bigint') return Number(v);
+      return v;
+    })
+  );
+}
+
+async function fetchDuckPage(pageIdx) {
+  if (duckFetching.has(pageIdx) || duckCache.has(pageIdx)) return;
+  duckFetching.add(pageIdx);
+  const offset = pageIdx * DUCK_PAGE;
+  const where  = duckFilter  ? `WHERE ${duckFilter}`    : '';
+  const order  = duckOrderBy ? `ORDER BY ${duckOrderBy}` : '';
+  try {
+    const res  = await duckConn.query(
+      `SELECT * FROM data ${where} ${order} LIMIT ${DUCK_PAGE} OFFSET ${offset}`
+    );
+    duckCache.set(pageIdx, arrowToRows(res, columns));
+    duckFetching.delete(pageIdx);
+    if (!rafPending) {
+      rafPending = true;
+      requestAnimationFrame(() => { renderRows(); rafPending = false; });
+    }
+  } catch (e) { console.error('DuckDB fetch:', e); duckFetching.delete(pageIdx); }
+}
+
+function getDuckWindowRows(startIdx, endIdx) {
+  const out = [];
+  const startPage = Math.floor(startIdx / DUCK_PAGE);
+  const endPage   = Math.floor(Math.max(0, endIdx - 1) / DUCK_PAGE);
+  for (let p = startPage; p <= endPage; p++) {
+    if (!duckCache.has(p)) fetchDuckPage(p);
+    const page  = duckCache.get(p);
+    const pBase = p * DUCK_PAGE;
+    const lo    = Math.max(0, startIdx - pBase);
+    const hi    = Math.min(page ? page.length : DUCK_PAGE, endIdx - pBase);
+    for (let i = lo; i < hi; i++) out.push(page ? page[i] : null);
+  }
+  return out;
+}
+
+async function updateDuckFilter() {
+  const conds = [];
+  if (searchQuery) {
+    const parts = columns.map(c =>
+      `TRY_CAST("${c.replace(/"/g,'""')}" AS VARCHAR) ILIKE '%${searchQuery.replace(/'/g,"''")}%'`
+    );
+    if (parts.length) conds.push(`(${parts.join(' OR ')})`);
+  }
+  columns.forEach(c => {
+    const f = (colFilters[c] || '').trim();
+    if (f) conds.push(`TRY_CAST("${c.replace(/"/g,'""')}" AS VARCHAR) ILIKE '%${f.replace(/'/g,"''")}%'`);
+  });
+  duckFilter = conds.join(' AND ');
+  duckCache.clear(); duckFetching.clear();
+  const where    = duckFilter ? `WHERE ${duckFilter}` : '';
+  const countRes = await duckConn.query(`SELECT COUNT(*)::BIGINT AS n FROM data ${where}`);
+  duckTotal = Number(countRes.toArray()[0].n);
+  const active = conds.length > 0;
+  searchInfo.textContent = active ? `${duckTotal.toLocaleString()} matches` : '';
+  clearFiltersBtn.style.display =
+    columns.some(c => (colFilters[c]||'').trim()) ? 'inline-flex' : 'none';
+  document.getElementById('s-showing').textContent = duckTotal.toLocaleString();
+  setupVirtualScroll();
+}
+
 /* ─── unified filter + search ────────────────────────────── */
-// Single source of truth for filtering. Called whenever the global
-// search query or any column filter changes.
 function applyFilters() {
+  if (duckMode) { updateDuckFilter(); return; }   // DuckDB handles its own filtering
   let rows = allRows;
 
   // 1. Global search — any column contains the query
@@ -899,16 +1015,21 @@ clearFiltersBtn.addEventListener('click', () => {
 
 /* ─── sort ───────────────────────────────────────────────── */
 function sortBy(colName) {
-  const idx = columns.indexOf(colName);
-  if (idx === -1) return;
+  if (queryMode) return;
   if (sortCol === colName) {
     sortDir = sortDir === 'asc' ? 'desc' : 'asc';
   } else {
     sortCol = colName; sortDir = 'asc';
   }
+  if (duckMode) {
+    duckOrderBy = `"${colName.replace(/"/g,'""')}" ${sortDir.toUpperCase()}`;
+    duckCache.clear(); duckFetching.clear();
+    updateSortHeaders(); setupVirtualScroll(); return;
+  }
+  const idx = columns.indexOf(colName);
+  if (idx === -1) return;
   filteredRows = sortedRows(filteredRows);
-  updateSortHeaders();
-  setupVirtualScroll();
+  updateSortHeaders(); setupVirtualScroll();
 }
 
 function sortedRows(rows) {
@@ -957,23 +1078,21 @@ colPanel.addEventListener('click', e => e.stopPropagation());
 function visibleCols() { return columns.filter(c => colVisible[c]); }
 
 /* ─── unified display state ──────────────────────────────── */
-// Single helper that tells callers what columns and rows to display
-// regardless of whether we're in normal filter mode or SQL query mode.
 function getTableState() {
   if (queryMode && queryResultCols) {
-    return {
-      cols: queryResultCols,
-      rows: queryResultRows,
-      cellVal: (row, i) => row[i],   // result rows are already col-ordered
-    };
+    return { cols: queryResultCols, rows: queryResultRows,
+             cellVal: (row, i) => (row ? row[i] : null), total: (queryResultRows||[]).length, isDuck: false };
+  }
+  if (duckMode) {
+    const vis = visibleCols();
+    const idx = vis.map(c => columns.indexOf(c));
+    return { cols: vis, rows: null, cellVal: (row, i) => (row ? row[idx[i]] : null),
+             total: duckTotal, isDuck: true };
   }
   const vis = visibleCols();
   const idx = vis.map(c => columns.indexOf(c));
-  return {
-    cols: vis,
-    rows: filteredRows,
-    cellVal: (row, i) => row[idx[i]], // look up original column position
-  };
+  return { cols: vis, rows: filteredRows, cellVal: (row, i) => row[idx[i]],
+           total: filteredRows.length, isDuck: false };
 }
 
 /* ─── column width CSS ───────────────────────────────────── */
@@ -1101,71 +1220,70 @@ function buildFilterRow() {
 let rafPending = false;
 
 function setupVirtualScroll() {
-  const { rows } = getTableState();
-  vbody.style.height = (rows.length * ROW_H) + 'px';
+  const { total, isDuck } = getTableState();
+  vbody.style.height   = (total * ROW_H) + 'px';
   vbody.style.position = 'relative';
-  vbody.innerHTML = '';
+  vbody.innerHTML      = '';
+  if (isDuck) fetchDuckPage(0);   // pre-fetch first page
   renderRows();
 }
 
 function renderRows() {
-  const { cols, rows, cellVal } = getTableState();
-
+  const { cols, rows, cellVal, total, isDuck } = getTableState();
   const scrollTop = tableWrap.scrollTop;
   const viewH     = tableWrap.clientHeight - headerGroup.offsetHeight;
-
-  const startIdx = Math.max(0, Math.floor(scrollTop / ROW_H) - BUFFER);
-  const endIdx   = Math.min(rows.length, Math.ceil((scrollTop + viewH) / ROW_H) + BUFFER);
+  const startIdx  = Math.max(0, Math.floor(scrollTop / ROW_H) - BUFFER);
+  const endIdx    = Math.min(total, Math.ceil((scrollTop + viewH) / ROW_H) + BUFFER);
 
   vbody.innerHTML = '';
-
-  const frag = document.createDocumentFragment();
-  const hlq  = queryMode ? '' : searchQuery;   // don't highlight in query mode
+  const frag      = document.createDocumentFragment();
+  const hlq       = queryMode ? '' : searchQuery;
+  const duckWin   = isDuck ? getDuckWindowRows(startIdx, endIdx) : null;
 
   for (let i = startIdx; i < endIdx; i++) {
-    const rowData = rows[i];
+    const rowData = isDuck ? duckWin[i - startIdx] : rows[i];
     const div = document.createElement('div');
     div.className = `row ${i % 2 === 0 ? 'even' : 'odd'}`;
-    div.style.cssText = `position:absolute;top:${i * ROW_H}px;left:0;right:0;height:${ROW_H}px;display:flex;align-items:center;`;
+    div.style.cssText = `position:absolute;top:${i*ROW_H}px;left:0;right:0;height:${ROW_H}px;display:flex;align-items:center;`;
 
-    // Row number
     const rn = document.createElement('div');
     rn.className = 'td rownum';
     rn.textContent = (i + 1).toLocaleString();
     div.appendChild(rn);
 
-    // Data cells — use cellVal() so query mode and normal mode both work
-    cols.forEach((col, colPos) => {
-      const val = cellVal(rowData, colPos);
-      const td  = document.createElement('div');
-      td.className = `td pv-col-${colPos}`;
-
-      let text;
-      if (val === null || val === undefined) {
-        text = 'null'; td.classList.add('null-val');
-      } else if (val instanceof Date) {
-        text = val.toISOString();
-      } else if (typeof val === 'number' || typeof val === 'bigint') {
-        text = String(val); td.classList.add('num-val');
-      } else if (typeof val === 'boolean') {
-        text = String(val); td.classList.add('bool-val');
-      } else if (typeof val === 'object') {
-        text = JSON.stringify(val);
-      } else {
-        text = String(val);
-      }
-
-      if (hlq && text.toLowerCase().includes(hlq)) {
-        const re = new RegExp(hlq.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
-        td.innerHTML = text.replace(re, m => `<mark>${m}</mark>`);
-      } else {
-        td.textContent = text;
-      }
-
-      td.title = text;
-      div.appendChild(td);
-    });
-
+    if (rowData === null) {
+      // Skeleton placeholder while DuckDB page is loading
+      cols.forEach((_, colPos) => {
+        const td = document.createElement('div');
+        td.className = `td pv-col-${colPos}`;
+        td.innerHTML = '<span style="background:#21262d;border-radius:3px;display:inline-block;width:60%;height:10px;animation:pulse 1.5s ease-in-out infinite"></span>';
+        div.appendChild(td);
+      });
+    } else {
+      cols.forEach((col, colPos) => {
+        const val = cellVal(rowData, colPos);
+        const td  = document.createElement('div');
+        td.className = `td pv-col-${colPos}`;
+        let text;
+        if (val === null || val === undefined) {
+          text = 'null'; td.classList.add('null-val');
+        } else if (val instanceof Date) {
+          text = val.toISOString();
+        } else if (typeof val === 'number' || typeof val === 'bigint') {
+          text = String(val); td.classList.add('num-val');
+        } else if (typeof val === 'boolean') {
+          text = String(val); td.classList.add('bool-val');
+        } else if (typeof val === 'object') {
+          text = JSON.stringify(val);
+        } else { text = String(val); }
+        if (hlq && text.toLowerCase().includes(hlq)) {
+          const re = new RegExp(hlq.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+          td.innerHTML = text.replace(re, m => `<mark>${m}</mark>`);
+        } else { td.textContent = text; }
+        td.title = text;
+        div.appendChild(td);
+      });
+    }
     frag.appendChild(div);
   }
   vbody.appendChild(frag);
@@ -1431,53 +1549,46 @@ function buildColChips() {
   });
 }
 
-function runQuery() {
+async function runQuery() {
   const sql = querySql.value.trim();
   if (!sql) return;
-
   queryError.classList.remove('visible');
   queryStatus.classList.remove('visible');
 
-  if (!window.alasql) {
-    showQueryError('AlaSQL library not loaded. Check your internet connection.');
-    return;
-  }
-
   try {
-    const results = alasql(sql);
+    let resultCols, resultRows;
 
-    if (!Array.isArray(results)) {
-      // Non-SELECT statement (e.g., a row count number)
-      queryStatus.textContent = `✓ Result: ${JSON.stringify(results)}`;
-      queryStatus.classList.add('visible');
-      return;
-    }
-    if (results.length === 0) {
-      // Valid query, no rows returned
-      queryResultCols = Object.keys(
-        alasql(`${sql} LIMIT 0`)[0] || results[0] || {}
-      );
-      if (!queryResultCols.length) queryResultCols = columns.slice();
-      queryResultRows = [];
+    if (duckMode && duckConn) {
+      // ── DuckDB SQL ──────────────────────────────────────────
+      const res = await duckConn.query(sql);
+      if (!res?.schema) {
+        queryStatus.textContent = '✓ Query executed';
+        queryStatus.classList.add('visible'); return;
+      }
+      resultCols = res.schema.fields.map(f => f.name);
+      resultRows = arrowToRows(res, resultCols);
     } else {
-      queryResultCols = Object.keys(results[0]);
-      queryResultRows = results.map(obj => queryResultCols.map(c => obj[c]));
+      // ── AlaSQL (small-file mode) ────────────────────────────
+      if (!window.alasql) { showQueryError('AlaSQL not loaded.'); return; }
+      const results = alasql(sql);
+      if (!Array.isArray(results)) {
+        queryStatus.textContent = `✓ Result: ${JSON.stringify(results)}`;
+        queryStatus.classList.add('visible'); return;
+      }
+      resultCols = results.length > 0 ? Object.keys(results[0]) : columns.slice();
+      resultRows = results.map(obj => resultCols.map(c => obj[c]));
     }
 
-    queryMode = true;
-    sortCol = null;   // clear sort — users can ORDER BY in SQL
+    queryResultCols = resultCols;
+    queryResultRows = resultRows;
+    queryMode = true; sortCol = null;
     document.body.classList.add('query-mode');
     queryModeBadge.classList.add('visible');
-
-    queryStatus.textContent = `✓ ${queryResultRows.length.toLocaleString()} row${queryResultRows.length !== 1 ? 's' : ''} returned`;
+    queryStatus.textContent = `✓ ${resultRows.length.toLocaleString()} row${resultRows.length !== 1 ? 's' : ''} returned`;
     queryStatus.classList.add('visible');
-    document.getElementById('s-showing').textContent = queryResultRows.length.toLocaleString();
-
-    buildHeader();
-    setupVirtualScroll();
-  } catch (err) {
-    showQueryError(err.message);
-  }
+    document.getElementById('s-showing').textContent = resultRows.length.toLocaleString();
+    buildHeader(); setupVirtualScroll();
+  } catch (err) { showQueryError(err.message); }
 }
 
 function showQueryError(msg) {
@@ -1576,7 +1687,11 @@ tableWrap.addEventListener('scroll', () => {
 
 /* ─── helpers ────────────────────────────────────────────── */
 function updateShowing() {
-  document.getElementById('s-showing').textContent = filteredRows.length.toLocaleString();
+  let count;
+  if (queryMode && queryResultRows) count = queryResultRows.length;
+  else if (duckMode)                count = duckTotal;
+  else                              count = filteredRows.length;
+  document.getElementById('s-showing').textContent = count.toLocaleString();
 }
 
 function fmtBytes(b) {
