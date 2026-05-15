@@ -839,7 +839,7 @@ function setProgress(pct, msg, detail) {
 async function ensureDuckDB() {
   if (duckDB) return;
   setProgress(15, 'Loading DuckDB engine (~6 MB)…');
-  const CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/';
+  const CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm/dist/';
   const mod = await import(CDN + 'duckdb-esm.js');
   const bundles = {
     mvp: { mainModule: CDN + 'duckdb-mvp.wasm',
